@@ -1,0 +1,262 @@
+---
+title: 'Project 2: reference-based assembly'
+author: "J Moggridge"
+date: "23/02/2021"
+bibliography: "6110_proj2assembly.bib"
+output: 
+  pdf_document:
+    highlight: kate
+---
+
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE, 
+  cache = TRUE, fig.align='left')
+library(tidyverse)
+library(lme4)
+library(ggbeeswarm)
+library(patchwork)
+library(glue)
+library(ggthemes)
+library(rcartocolor)
+library(pander)
+```
+
+<!-- An Introduction (25% of score) describing the goals and challenges of aligning sequence reads to a -->
+<!-- reference genome, including the potential pros and cons of using a distantly related genome vs. a very -->
+<!-- fragmented reference from the same species. -->
+
+# Introduction
+
+Reference-guided assembly involves mapping new sequencing reads to an existing genome; this is an important processing step prior to genotyping for analysis of genome-wide associations or phylogenetic inference, for example. Reference-guided assembly is simpler and faster than *de-novo* assembly but choosing a suitable reference genome to align reads to is crucial. Depending on the species of interest, the reference genome may be of low quality (*i.e.* many gaps) or unavailable entirely, as there are very few reference genomes compared to the enormous number of known species.
+
+If there is no reference for the species of interest, it is common practice to use a high quality reference genome of a closely-related species instead. However, if there is not a high degree of homology between the subject and reference genomes, many reads will fail to align to the assembly regardless of quality. 
+If the reference genome used is of low quality, many reads may fail to be aligned due to gaps in the assembly, even if the individual and the reference are closely-related. 
+In either of these cases, incorrectly mapped or unmapped reads leads to errors in genotyping that can bias later analyses [@bohling_evaluating_2020]. Even when considering the genomes of closely-related species, the choice of reference can subtly impact findings, for example the number of variants found or heterozygosity estimates [@gopalakrishnan_wolf_2017].  
+
+In this work, the trade-off in these concerns (relatedness and assembly quality) for read mapping is examined through an analysis of data from a genotyping by sequencing study of burbot (*Lota lota*). A burbot reference genome exists but is of low quality, while a high quality reference is available for the Atlantic cod [*Gadus morhua*; @torresen_improved_2017]. Illumina single-end reads from 10 individuals were mapped to both cod and burbot reference genomes using both `bwa` and `bowtie2` (very sensitive option); reads mapped were recorded for comparison of reference genomes and aligners.  
+
+# Methods
+
+All the scripts and output files for this analysis can be found on graham in `/scratch/jmoggrid/Project2/`. I performed the alignments using the `bash` commands below. In practice, each aligner/reference combination was executed separately with smaller time allocation (scripts named: `run_<aligner>_<reference>.sh`). Lines that are too long (with \\) have been wrapped for readability. 
+
+```{r bash-align, engine = 'bash', eval = FALSE, echo=TRUE}
+#!/bin/sh
+#SBATCH --account=def-nricker
+#SBATCH --time=0-03:00:00 
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --mem=16000
+#SBATCH --mail-type=END
+module load bwa/0.7.17
+module load bowtie2
+
+## align each fq file to COD ref using BWA
+for file in *.fq.gz; do
+  basename=`echo $file | sed 's/\.fq\.gz//'`;
+  bwa mem -t 16 cod_reference_genome/GCF_902167405.1_gadMor3.0_genomic.fna $file \
+    > $basename.bwa.cod.sam
+done
+## align each fq file to BURBOT ref using BWA
+for file in *.fq.gz; do
+  basename=`echo $file | sed 's/\.fq\.gz//'`;
+  bwa mem -t 16 burbot_reference_genome/GCA_900302385.1_ASM90030238v1_genomic.fna $file \
+    > $basename.bwa.burbot.sam
+done
+## align each fq file to COD ref using BOWTIE2
+for file in *.fq.gz; do
+  basename=`echo $file | sed 's/\.fq\.gz//'`;
+  bowtie2 -x cod_reference_genome/GCF_902167405.1_gadMor3.0_genomic -U $file \
+    -S $basename.bowtie.cod.sam --very-sensitive-local;
+done
+## align each fq file to BURBOT ref using BOWTIE2
+for file in *.fq.gz; do
+  basename=`echo $file | sed 's/\.fq\.gz//'`;
+  bowtie2 -x burbot_reference_genome/GCA_900302385.1_ASM90030238v1_genomic -U $file \
+    -S $basename.bowtie.burbot.sam --very-sensitive-local;
+done
+```
+
+Then, I collected the percentage of reads mapped for each individual in each of the four treatments using `samtools stats` and `flagstats` (script: `run_collect_stats.sh`).  
+
+```{r bash-samtools, engine = 'bash', eval = FALSE, echo=TRUE}
+#!/bin/sh
+
+## Create a csv file with header line
+touch alignments_data.csv
+echo "Sample,Aligner,Reference,Total,Mapped,Unmapped,mQ0, \  
+      PercentMapped,Secondary,Supplementary" > alignments_data.csv
+
+## Wrangle data of interest from samtools stats and flagstats
+module load samtools
+for file in *.sam; do
+  echo $file;
+  sample=`echo $file | sed 's/\..*//'`;
+  if echo $file | grep -q 'bwa'; then
+    aligner='bwa'
+  elif echo $file | grep -q 'bowtie'; then
+    aligner='bowtie2'
+  fi;
+  if echo $file | grep -q 'cod'; then
+    reference='cod'
+  elif echo $file | grep -q 'burbot'; then
+    reference='burbot'
+  fi;
+  touch temp;
+  samtools stats $file > temp;
+  total=`grep 'raw total sequences' temp | cut -f3`;
+  mapped=`grep 'reads mapped:' temp | cut -f3`;
+  unmapped=`grep 'reads unmapped:' temp | cut -f3`;
+  mQ0=`grep 'reads MQ0:' temp | cut -f3`;
+  samtools flagstats $file > temp;
+  percentMapped=`grep % temp | sed -r 's/.*\(|% : .*\)//g'`;
+  secondary=`grep 'secondary' | sed 's/ + 0 secondary//'`
+  supplementary= `grep 'supplementary' | sed 's/ + 0 supplementary//'`
+  echo "$sample,$aligner,$reference,$total,$mapped,$unmapped, \
+    $mQ0,$percentMapped,$secondary,$supplementary" >> \
+    alignments_data.csv;
+done
+rm temp
+```
+
+R code for statistical analysis:
+
+```{r tidy, echo=TRUE, include=T}
+library(tidyverse)
+library(rstatix)
+# compute group means and sd of % mapped
+burbot <- read_csv('alignments_data.csv') %>% 
+  group_by(Aligner, Reference) %>% 
+  mutate(`% mapped mean` = mean(PercentMapped),
+           `% mapped sd` = sd(PercentMapped)) %>% 
+  ungroup()
+# repeated measures ANOVA
+burbot.anova <- rstatix::anova_test(
+  data = burbot, dv = PercentMapped, wid = Sample, within = c(Reference, Aligner))
+```
+
+
+```{r create table 1}
+table1 <- burbot %>%
+  select(Aligner, Reference, `% mapped mean`, `% mapped sd`) %>%
+  distinct() %>%
+  mutate(across(where(is.numeric), round, 1)) %>%
+  mutate(`% mapped (sd)`= glue("{`% mapped mean`} ({`% mapped sd`})")) %>%
+  select(Aligner, Reference, `% mapped (sd)`)
+```
+
+
+```{r create plots}
+theme_jason <- function(){
+  theme_linedraw() +
+  theme(
+    panel.grid = element_line(color = 'grey80'),
+    strip.background = element_rect(fill='gray98', color = 'gray20'),
+    strip.text = element_text(color = 'black'))
+}
+panel1 <- burbot %>% 
+  select(Sample, Mapped, Unmapped, Aligner, Reference) %>% 
+  distinct() %>% 
+  pivot_longer(cols = c(Unmapped,Mapped)) %>% 
+  mutate(name = as_factor(name)) %>% 
+  mutate(value = value/10**6) %>% 
+  ggplot(., aes(y=Sample, x=value, fill=name)) +
+  geom_col(alpha = 0.8) +
+  labs(x = "Total Reads (M)", y ='') + 
+  scale_fill_carto_d('') +
+  facet_wrap(Reference~Aligner, nrow = 1, scales = 'free_x') +
+  theme_jason()
+
+# panel2
+plt1 <- burbot %>% 
+  ggplot(aes(y = Sample, x = PercentMapped, colour = Aligner,
+             lty = Aligner, group = Aligner, fill = Aligner)) +  
+  geom_path(alpha = 0.75) +
+  geom_point() +
+  scale_color_discrete('') +
+  scale_fill_discrete('') +
+  scale_linetype_discrete('') +
+  facet_wrap(~Reference, nrow=1, scales= 'free_x') + 
+  labs(y = '', x = "% reads mapped") +
+  theme_jason()
+  
+plt2 <- ggplot(burbot, 
+       aes(x = Aligner, y=PercentMapped, 
+           ymax=`% mapped mean`, ymin = `% mapped mean`, 
+           color = Aligner, group=Aligner, lty = Aligner,
+           fill = Aligner)) +
+  geom_errorbar(colour = 'darkgray',alpha = 0.21, lty=1) +
+  geom_violin(alpha = 0.25, draw_quantiles = 0,
+              color = NA, trim = FALSE) +
+  geom_quasirandom(priority = 'none', size=1.5) + 
+  scale_color_discrete('') +
+  scale_fill_discrete('') +
+  scale_linetype_discrete('') +
+  facet_wrap(~Reference, scales = 'free') +
+  labs(y = "% of reads mapped", x = "") +
+  theme_jason() +
+  theme(legend.position = 'null')
+```
+
+
+# Results
+
+Statistical analysis of the number of aligned reads was conducted in the `R` language. I computed group means and standard deviations for the percentage of reads mapped by each treatment (table 1).  Because of the within-subjects design of this two-factor experiment, I performed a repeated measures ANOVA using the `rstatix` package to discern whether the choice of alignment tool or reference genome has an effect on the proportion of reads mapped (table 2).
+
+```{r show table1}
+table1 %>%
+  pander(caption = glue(
+  "Summary table for percentage of reads mapped in four",
+  "conditions: with cod or burbot reference genome, ",
+  "with bwa or bowtie2 alignment.")
+  )
+```
+
+Of the two reference genomes, a significantly greater proportion of burbot reads are unambiguously aligned when using the highly fragmented burbot reference (~85 % mapped) as opposed to the higher-quality but more genetically-distant cod reference (~30 % mapped; tables 1,2, fig. 2R). 
+The effect of alignment tool is rather minimal in comparison, but this was still significant according to repeated measures ANOVA (with each individual taken into account as a random effect). Overall, there is relatively little variation in the percentage of reads mapped among individuals for a given treatment. Interestingly, a similar trend in individuals' values is seen across all treatments (fig. 2L).
+
+
+```{r fig.height=2.5, fig.width=8, fig.cap="Total and mapped reads for each indivdual to either burbot or cod reference, with either `bwa` or `bowtie2` aligners."}
+panel1
+```
+  
+  
+```{r ANOVA table}
+get_anova_table(burbot.anova) %>% pander(caption='Summary table for repeated measures ANOVA for effects of reference genome and alignment tool choices on the percentage of burbot reads mapped.')
+```
+      
+    
+```{r fig.width=8, fig.height=2.4}
+(plt1 + plot_spacer() + plt2 + guide_area()) +
+  plot_layout(guides = 'collect', widths = c(1, 0.05, 1, 0.3))
+```
+Figure 2. Percentage of burbot reads mapped against either burbot or cod reference, using either bwa or bowtie2. Each point is an individual, lines indicate the group mean. Note that vastly different scales are used for the % of reads mapped each reference genome.
+        
+\newpage
+
+# Discussion
+
+Reference-guided assembly is a critical processing step prior to identification of variants for genomics analyses. However, reference choice may be a source of bias in read-mapping and genotyping, influencing later analyses. Reference-bias occurs because read mapping has greater success for sequences that are similar to the reference specimen, leading to an underestimation of non-reference alleles [@brandt_mapping_2015].
+In this work, I investigated whether the choice of cod or burbot reference genome would impact the proportion of reads mapped for ten burbots.
+These reference genomes have vast differences in assembly quality, where the cod genome (length 670 Mb) is comprised of 227 scaffolds and the burbot genome (length 397 Mb) has 106,616 scaffolds. 
+
+Of the two reference genomes, a greater proportion of burbot reads are unambiguously aligned when using the burbot reference than the cod reference (fig. 2R). 
+Interestingly, the choice of reference appears to scale the proportion of reads mapped in a nearly identical fashion for each individual (fig. 2L). 
+This suggests that variation in mapping rates among individuals is not due to differences in genetic distance to either reference. We would take this as evidence that read-mapping success is not differentially-biased among individuals by the choice of reference for this data.
+
+In contrast to reference selection, the choice of `bowtie2` or `bwa` as the alignment tool has only a small impact on mapping rates (fig. 2), which is not surprising given that they use similar approaches based on the Burrows-Wheeler transform [@li_fast_2009]. 
+The two aligners had equal mapping rates when the burbot reference is used, while `bowtie2` had slightly better performance across all individuals when mapping to the cod reference (fig. 2L). 
+Despite the small effect size relative to variation among individuals, the choice of alignment and the interaction effect of reference genome and alignment tool were both significant according to repeated measures ANOVA (table 2). 
+Nevertheless, it seems that either tool should work equally well on a given reference genome, with `bowtie2` potentially having slightly better performance when reads are mapped to a more distant reference.
+
+Generally, we would choose the burbot genome for reference-guided assembly of burbot reads, since this yields a far greater proportion of mapped reads from a given individual and will provide us with more data for genotyping and later analysis.
+However, if conducting a study comparing burbot and other species rather than only burbot populations, it may be beneficial to use the more complete but genetically-distant cod reference to reduce bias in read mapping [@gopalakrishnan_wolf_2017]. 
+Depending on the goals of the experiment, the completeness and functional annotation of the reference genomes may also be important factors to consider. 
+If we were wanting to compare results to others in the literature, it might be beneficial to use the same reference [@lloret-villas_investigating_2021]. 
+A caveat of this analysis is that reference genome quality and content were not investigated, only the proportions of reads mapped were compared among treatments. From this data alone, I cannot speculate on whether choice of reference genome or alignment tool would lead to biases in variant calling for these individuals.
+
+---
+
+# References
