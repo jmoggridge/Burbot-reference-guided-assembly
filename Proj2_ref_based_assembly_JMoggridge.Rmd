@@ -1,5 +1,5 @@
 ---
-title: 'Project 2: reference-based assembly'
+title: 'Project 2: Reference-guided assembly of short reads from burbot (*Lota lota*): impact of reference genome and alignment tool selection'
 author: "J Moggridge"
 date: "23/02/2021"
 bibliography: "6110_proj2assembly.bib"
@@ -10,16 +10,14 @@ output:
 
 
 ```{r setup, include=FALSE}
-library(knitr)
 knitr::opts_chunk$set(
   echo = FALSE, warning = FALSE, message = FALSE, 
   cache = TRUE, fig.align='left')
 library(tidyverse)
-library(lme4)
+library(rstatix)
 library(ggbeeswarm)
 library(patchwork)
 library(glue)
-library(ggthemes)
 library(rcartocolor)
 library(pander)
 ```
